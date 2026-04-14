@@ -131,7 +131,7 @@ inline Specification parseSpec(const std::string& filename) {
 static std::string joinLTL(const std::vector<std::string>& v) {
     std::string r;
     for (size_t i = 0; i < v.size(); ++i) {
-        if (i) r += " & ";
+        if (i) r += " && ";
         r += "(" + v[i] + ")";
     }
     return r;
@@ -151,7 +151,7 @@ inline std::string buildNegatedLTL(const Specification& spec) {
         if (spec.guarantees.empty()) return "0";
         return "!(" + joinLTL(spec.guarantees) + ")";
     }
-    return "(" + joinLTL(spec.assumptions) + ") & !("
+    return "(" + joinLTL(spec.assumptions) + ") && !("
          + joinLTL(spec.guarantees) + ")";
 }
 
@@ -252,6 +252,7 @@ static void usage(const char* prog) {
         << "  --encoding <input-symbolic|state-symbolic|symbolic>  (default: input-symbolic)\n"
         << "  --solver <command>        External QBF/DQBF solver command\n"
         << "  --ltl2tgba <path>         Path to ltl2tgba (default: ltl2tgba)\n"
+        << "  --ltl3ba <path>           Use ltl3ba instead of ltl2tgba\n"
         << "  --bound <n>               Use a fixed bound (skip search)\n"
         << "  --max-bound <n>           Maximum bound for search (default: 32)\n"
         << "  --no-dual                 Disable parallel environment search\n"
@@ -271,6 +272,7 @@ int main(int argc, char* argv[]) {
     std::string encoding   = "input-symbolic";
     std::string solver;
     std::string ltl2tgba   = "ltl2tgba";
+    std::string ltl3ba;
     int fixedBound         = -1;
     int maxBound           = 32;
     bool verbose           = false;
@@ -286,6 +288,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--encoding" && i+1<argc) encoding = argv[++i];
         else if (a == "--solver"   && i+1<argc) solver   = argv[++i];
         else if (a == "--ltl2tgba" && i+1<argc) ltl2tgba = argv[++i];
+        else if (a == "--ltl3ba"  && i+1<argc) ltl3ba   = argv[++i];
         else if (a == "--bound"    && i+1<argc) fixedBound = std::atoi(argv[++i]);
         else if (a == "--max-bound"&& i+1<argc) maxBound   = std::atoi(argv[++i]);
         else if (a[0] != '-') specFile = a;
@@ -313,7 +316,9 @@ int main(int argc, char* argv[]) {
         std::string sysLTL = buildNegatedLTL(spec);
         if (verbose) std::cerr << "System LTL (negated): " << sysLTL << "\n";
 
-        CoBuchiAutomaton sysAut = ltlToAutomaton(sysLTL, ltl2tgba);
+        CoBuchiAutomaton sysAut = ltl3ba.empty()
+            ? ltlToAutomaton(sysLTL, ltl2tgba)
+            : ltl3baToAutomaton(sysLTL, ltl3ba);
         if (verbose) {
             std::cerr << "System automaton: " << sysAut.states.size()
                       << " states, " << sysAut.rejectingStates.size()
@@ -328,7 +333,9 @@ int main(int argc, char* argv[]) {
             std::string envLTL = buildNegatedLTL(envSpec);
             if (verbose) std::cerr << "Environment LTL (negated): " << envLTL << "\n";
 
-            envAut = ltlToAutomaton(envLTL, ltl2tgba);
+            envAut = ltl3ba.empty()
+                ? ltlToAutomaton(envLTL, ltl2tgba)
+                : ltl3baToAutomaton(envLTL, ltl3ba);
             if (verbose) {
                 std::cerr << "Environment automaton: " << envAut.states.size()
                           << " states, " << envAut.rejectingStates.size()

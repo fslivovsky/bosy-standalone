@@ -390,3 +390,17 @@ inline CoBuchiAutomaton ltlToAutomaton(const std::string& ltl,
         throw std::runtime_error(ltl2tgba + " failed:\n" + output);
     return parseSpinNeverClaim(output);
 }
+
+inline CoBuchiAutomaton ltl3baToAutomaton(const std::string& ltl,
+                                          const std::string& ltl3ba) {
+    std::string cmd = ltl3ba + " -f " + shellEscape("(" + ltl + ")") + " 2>&1";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) throw std::runtime_error("failed to run " + ltl3ba);
+    std::string output;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) output += buf;
+    int st = pclose(pipe);
+    if (WEXITSTATUS(st) != 0)
+        throw std::runtime_error(ltl3ba + " failed:\n" + output);
+    return parseSpinNeverClaim(output);
+}
