@@ -230,11 +230,13 @@ inline std::string writeTempFile(const std::string& content,
     std::vector<char> path(tmpl.begin(), tmpl.end());
     path.push_back('\0');
     int fd = mkstemp(path.data());
-    if (fd < 0) throw std::runtime_error("mkstemp failed");
+    if (fd < 0) throw std::runtime_error("mkstemp failed for template '"
+                                        + tmpl + "': " + strerror(errno));
     size_t total = 0;
     while (total < content.size()) {
         ssize_t n = write(fd, content.data() + total, content.size() - total);
-        if (n <= 0) { close(fd); throw std::runtime_error("write failed"); }
+        if (n <= 0) { close(fd); throw std::runtime_error(
+            "write failed for '" + std::string(path.data()) + "': " + strerror(errno)); }
         total += n;
     }
     close(fd);
