@@ -223,9 +223,10 @@ inline SolverResult runSolver(const std::string& solverCmd,
 // ===================================================================
 
 inline std::string writeTempFile(const std::string& content,
-                                 const std::string& suffix)
+                                 const std::string& suffix,
+                                 const std::string& tmpDir = "/tmp")
 {
-    std::string tmpl = "/tmp/bosy_" + suffix + "_XXXXXX";
+    std::string tmpl = tmpDir + "/bosy_" + suffix + "_XXXXXX";
     std::vector<char> path(tmpl.begin(), tmpl.end());
     path.push_back('\0');
     int fd = mkstemp(path.data());
@@ -253,6 +254,7 @@ static void usage(const char* prog) {
         << "  --solver <command>        External QBF/DQBF solver command\n"
         << "  --ltl2tgba <path>         Path to ltl2tgba (default: ltl2tgba)\n"
         << "  --ltl3ba <path>           Use ltl3ba instead of ltl2tgba\n"
+        << "  --tmp-dir <dir>           Directory for temporary files (default: /tmp)\n"
         << "  --bound <n>               Use a fixed bound (skip search)\n"
         << "  --max-bound <n>           Maximum bound for search (default: 32)\n"
         << "  --no-dual                 Disable parallel environment search\n"
@@ -273,6 +275,7 @@ int main(int argc, char* argv[]) {
     std::string solver;
     std::string ltl2tgba   = "ltl2tgba";
     std::string ltl3ba;
+    std::string tmpDir     = "/tmp";
     int fixedBound         = -1;
     int maxBound           = 32;
     bool verbose           = false;
@@ -289,6 +292,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--solver"   && i+1<argc) solver   = argv[++i];
         else if (a == "--ltl2tgba" && i+1<argc) ltl2tgba = argv[++i];
         else if (a == "--ltl3ba"  && i+1<argc) ltl3ba   = argv[++i];
+        else if (a == "--tmp-dir" && i+1<argc) tmpDir  = argv[++i];
         else if (a == "--bound"    && i+1<argc) fixedBound = std::atoi(argv[++i]);
         else if (a == "--max-bound"&& i+1<argc) maxBound   = std::atoi(argv[++i]);
         else if (a[0] != '-') specFile = a;
@@ -397,7 +401,7 @@ int main(int argc, char* argv[]) {
                 break;
             }
             }
-            std::string path = writeTempFile(encoded, suffix);
+            std::string path = writeTempFile(encoded, suffix, tmpDir);
             SolverResult res = runSolver(solver, path, verbose);
             unlink(path.c_str());
             return res;
