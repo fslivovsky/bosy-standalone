@@ -226,10 +226,11 @@ inline std::string writeTempFile(const std::string& content,
                                  const std::string& suffix,
                                  const std::string& tmpDir = "/tmp")
 {
-    std::string tmpl = tmpDir + "/bosy_" + suffix + "_XXXXXX";
+    std::string tmpl = tmpDir + "/bosy_XXXXXX." + suffix;
     std::vector<char> path(tmpl.begin(), tmpl.end());
     path.push_back('\0');
-    int fd = mkstemp(path.data());
+    int suffixLen = (int)suffix.size() + 1;  // +1 for the dot
+    int fd = mkstemps(path.data(), suffixLen);
     if (fd < 0) throw std::runtime_error("mkstemp failed for template '"
                                         + tmpl + "': " + strerror(errno));
     size_t total = 0;
@@ -257,6 +258,7 @@ static void usage(const char* prog) {
         << "  --ltl2tgba <path>         Path to ltl2tgba (default: ltl2tgba)\n"
         << "  --ltl3ba <path>           Use ltl3ba instead of ltl2tgba\n"
         << "  --tmp-dir <dir>           Directory for temporary files (default: /tmp)\n"
+        << "  --write-dir <dir>         Write encodings to named files in <dir> (kept)\n"
         << "  --bound <n>               Use a fixed bound (skip search)\n"
         << "  --max-bound <n>           Maximum bound for search (default: 32)\n"
         << "  --no-dual                 Disable parallel environment search\n"
@@ -278,6 +280,7 @@ int main(int argc, char* argv[]) {
     std::string ltl2tgba   = "ltl2tgba";
     std::string ltl3ba;
     std::string tmpDir     = "/tmp";
+    std::string writeDir;
     int fixedBound         = -1;
     int maxBound           = 32;
     bool verbose           = false;
@@ -294,7 +297,8 @@ int main(int argc, char* argv[]) {
         else if (a == "--solver"   && i+1<argc) solver   = argv[++i];
         else if (a == "--ltl2tgba" && i+1<argc) ltl2tgba = argv[++i];
         else if (a == "--ltl3ba"  && i+1<argc) ltl3ba   = argv[++i];
-        else if (a == "--tmp-dir" && i+1<argc) tmpDir  = argv[++i];
+        else if (a == "--tmp-dir"  && i+1<argc) tmpDir   = argv[++i];
+        else if (a == "--write-dir"&& i+1<argc) writeDir = argv[++i];
         else if (a == "--bound"    && i+1<argc) fixedBound = std::atoi(argv[++i]);
         else if (a == "--max-bound"&& i+1<argc) maxBound   = std::atoi(argv[++i]);
         else if (a[0] != '-') specFile = a;
@@ -381,7 +385,7 @@ int main(int argc, char* argv[]) {
         // --- helper: encode + solve for one player at one bound ---
         auto solveOnce = [&](const CoBuchiAutomaton& aut,
                              const Specification& playerSpec,
-                             int b) -> SolverResult {
+                             int b, const char* label) -> SolverResult {
             std::string encoded, suffix;
             switch (encKind) {
             case ENC_QBF: {
@@ -403,9 +407,21 @@ int main(int argc, char* argv[]) {
                 break;
             }
             }
-            std::string path = writeTempFile(encoded, suffix, tmpDir);
+            std::string path;
+            bool keep = false;
+            if (!writeDir.empty()) {
+                path = writeDir + "/" + label + "_bound_"
+                     + std::to_string(b) + "." + suffix;
+                std::ofstream out(path);
+                if (!out) throw std::runtime_error(
+                    "cannot write '" + path + "': " + strerror(errno));
+                out << encoded;
+                keep = true;
+            } else {
+                path = writeTempFile(encoded, suffix, tmpDir);
+            }
             SolverResult res = runSolver(solver, path, verbose);
-            unlink(path.c_str());
+            if (!keep) unlink(path.c_str());
             return res;
         };
 
@@ -430,7 +446,7 @@ int main(int argc, char* argv[]) {
                 if (cancelled) break;
                 if (verbose)
                     std::cerr << "  [" << label << "] trying bound " << b << " ...\n";
-                SolverResult r = solveOnce(aut, playerSpec, b);
+                SolverResult r = solveOnce(aut, playerSpec, b, label);
                 if (r == SAT) {
                     resultBound = b;
                     winner = playerId;
@@ -445,14 +461,14 @@ int main(int argc, char* argv[]) {
         if (fixedBound > 0) {
             // --- fixed bound: try both players at this bound ---
             if (verbose) std::cerr << "  [system] trying bound " << fixedBound << " ...\n";
-            SolverResult sr = solveOnce(sysAut, spec, fixedBound);
+            SolverResult sr = solveOnce(sysAut, spec, fixedBound, "system");
             if (sr == SAT) {
                 std::cout << "REALIZABLE (bound " << fixedBound << ")\n";
                 return 0;
             }
             if (dualSearch) {
                 if (verbose) std::cerr << "  [environment] trying bound " << fixedBound << " ...\n";
-                SolverResult er = solveOnce(envAut, envSpec, fixedBound);
+                SolverResult er = solveOnce(envAut, envSpec, fixedBound, "environment");
                 if (er == SAT) {
                     std::cout << "UNREALIZABLE (bound " << fixedBound << ")\n";
                     return 0;

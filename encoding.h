@@ -282,6 +282,9 @@ struct DQBFProblem {
         std::vector<std::string> deps;  // names of universal vars
     };
     std::vector<DepVar> existentialVars;
+    // Pairs of existential variables that represent the same function
+    // on renamed universal arguments (for solver hints, e.g. pedant).
+    std::vector<std::pair<std::string, std::string>> equivalentVars;
 };
 
 // Serialise a DQBFProblem to DQDIMACS text.
@@ -324,6 +327,10 @@ inline std::string toDQDIMACS(const DQBFProblem& prob) {
         for (int id : auxIds) out << " " << id;
         out << " 0\n";
     }
+
+    // equivalence hints (for solvers like pedant)
+    for (auto& [a, b] : prob.equivalentVars)
+        out << "c= " << enc.atomId(a) << " " << enc.atomId(b) << " 0\n";
 
     // CNF clauses
     for (auto& cl : enc.clauses()) {
@@ -548,11 +555,13 @@ inline DQBFProblem buildStateSymbolicDQBF(const CoBuchiAutomaton& aut,
     for (auto& q : aut.states) {
         addDep(lamS(q),  sVars);
         addDep(lamSP(q), spVars);
+        prob.equivalentVars.push_back({lamS(q), lamSP(q)});
     }
     for (auto& q : aut.states)
         for (int b = 0; b < nb; ++b) {
             addDep(lsS(q, b),  sVars);
             addDep(lsSP(q, b), spVars);
+            prob.equivalentVars.push_back({lsS(q, b), lsSP(q, b)});
         }
 
     std::vector<std::string> tauDeps = sVars;
@@ -736,10 +745,14 @@ inline DQBFProblem buildSymbolicDQBF(const CoBuchiAutomaton& aut,
 
     addDep("l_cur",  qsDeps);
     addDep("l_next", qpspDeps);
+    prob.equivalentVars.push_back({"l_cur", "l_next"});
 
     for (int b = 0; b < numRank; ++b) {
-        addDep("ls_" + std::to_string(b) + "_cur",  qsDeps);
-        addDep("ls_" + std::to_string(b) + "_next", qpspDeps);
+        std::string cur  = "ls_" + std::to_string(b) + "_cur";
+        std::string next = "ls_" + std::to_string(b) + "_next";
+        addDep(cur,  qsDeps);
+        addDep(next, qpspDeps);
+        prob.equivalentVars.push_back({cur, next});
     }
 
     std::vector<std::string> tauDeps = sVars;
