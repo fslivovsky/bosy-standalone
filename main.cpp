@@ -253,7 +253,8 @@ static void usage(const char* prog) {
         << "Usage: " << prog << " [options] <spec.json>\n"
         << "\n"
         << "Options:\n"
-        << "  --encoding <input-symbolic|state-symbolic|symbolic>  (default: input-symbolic)\n"
+        << "  --encoding <input-symbolic|state-symbolic|symbolic|subformula|subformula-bicond>\n"
+        << "                            (default: input-symbolic)\n"
         << "  --solver <command>        External QBF/DQBF solver command\n"
         << "  --ltl2tgba <path>         Path to ltl2tgba (default: ltl2tgba)\n"
         << "  --ltl3ba <path>           Use ltl3ba instead of ltl2tgba\n"
@@ -307,10 +308,12 @@ int main(int argc, char* argv[]) {
 
     if (specFile.empty()) { usage(argv[0]); return 1; }
 
-    enum EncKind { ENC_QBF, ENC_STATE_SYM, ENC_SYMBOLIC };
+    enum EncKind { ENC_QBF, ENC_STATE_SYM, ENC_SYMBOLIC, ENC_SUBFORMULA, ENC_SUBFORMULA_BICOND };
     EncKind encKind = ENC_QBF;
     if (encoding == "state-symbolic") encKind = ENC_STATE_SYM;
     else if (encoding == "symbolic")  encKind = ENC_SYMBOLIC;
+    else if (encoding == "subformula") encKind = ENC_SUBFORMULA;
+    else if (encoding == "subformula-bicond") encKind = ENC_SUBFORMULA_BICOND;
 
     try {
         // 1. Parse specification
@@ -322,34 +325,65 @@ int main(int argc, char* argv[]) {
                       << spec.outputs.size() << " outputs\n";
         }
 
-        // 2. Build automaton for system player: !(A -> G)
+        // 2. Build automaton or parse LTL for system player.
+        // The automaton-based encodings consume A_(¬φ) (Büchi accepting bad
+        // traces) and reinterpret it as a universal co-Büchi for φ.  The
+        // subformula tableau, by contrast, builds the alternating co-Büchi
+        // for φ DIRECTLY — so it consumes φ in NNF, not ¬φ.
         std::string sysLTL = buildNegatedLTL(spec);
         if (verbose) std::cerr << "System LTL (negated): " << sysLTL << "\n";
 
-        CoBuchiAutomaton sysAut = ltl3ba.empty()
-            ? ltlToAutomaton(sysLTL, ltl2tgba)
-            : ltl3baToAutomaton(sysLTL, ltl3ba);
-        if (verbose) {
-            std::cerr << "System automaton: " << sysAut.states.size()
-                      << " states, " << sysAut.rejectingStates.size()
-                      << " rejecting\n";
+        CoBuchiAutomaton sysAut;
+        Ltl sysLtl;
+        if (encKind == ENC_SUBFORMULA || encKind == ENC_SUBFORMULA_BICOND) {
+            sysLtl = toNNF(parseLtl(buildLTL(spec)));
+            if (verbose) {
+                SubformulaIndex idx; idx.enumerate(sysLtl);
+                int nTemp = 0, nEv = 0;
+                for (auto& sf : idx.all()) {
+                    if (isTemporal(sf->kind)) ++nTemp;
+                    if (isEventuality(sf)) ++nEv;
+                }
+                std::cerr << "System NNF: " << idx.size() << " subformulas, "
+                          << nTemp << " temporal, "
+                          << nEv << " eventualities\n";
+            }
+        } else {
+            sysAut = ltl3ba.empty()
+                ? ltlToAutomaton(sysLTL, ltl2tgba)
+                : ltl3baToAutomaton(sysLTL, ltl3ba);
+            if (verbose) {
+                std::cerr << "System automaton: " << sysAut.states.size()
+                          << " states, " << sysAut.rejectingStates.size()
+                          << " rejecting\n";
+            }
         }
 
-        // 3. Build automaton for environment player (dualized spec)
+        // 3. Build automaton/LTL for environment player (dualized spec)
         Specification envSpec;
         CoBuchiAutomaton envAut;
+        Ltl envLtl;
         if (dualSearch && !dumpOnly) {
             envSpec = dualize(spec);
             std::string envLTL = buildNegatedLTL(envSpec);
             if (verbose) std::cerr << "Environment LTL (negated): " << envLTL << "\n";
 
-            envAut = ltl3ba.empty()
-                ? ltlToAutomaton(envLTL, ltl2tgba)
-                : ltl3baToAutomaton(envLTL, ltl3ba);
-            if (verbose) {
-                std::cerr << "Environment automaton: " << envAut.states.size()
-                          << " states, " << envAut.rejectingStates.size()
-                          << " rejecting\n";
+            if (encKind == ENC_SUBFORMULA || encKind == ENC_SUBFORMULA_BICOND) {
+                envLtl = toNNF(parseLtl(buildLTL(envSpec)));
+                if (verbose) {
+                    SubformulaIndex idx; idx.enumerate(envLtl);
+                    std::cerr << "Environment NNF: " << idx.size()
+                              << " subformulas\n";
+                }
+            } else {
+                envAut = ltl3ba.empty()
+                    ? ltlToAutomaton(envLTL, ltl2tgba)
+                    : ltl3baToAutomaton(envLTL, ltl3ba);
+                if (verbose) {
+                    std::cerr << "Environment automaton: " << envAut.states.size()
+                              << " states, " << envAut.rejectingStates.size()
+                              << " rejecting\n";
+                }
             }
         }
 
@@ -372,6 +406,16 @@ int main(int argc, char* argv[]) {
                 std::cout << toDQDIMACS(p);
                 break;
             }
+            case ENC_SUBFORMULA: {
+                DQBFProblem p = buildSubformulaTableauDQBF(sysLtl, spec, b);
+                std::cout << toDQDIMACS(p);
+                break;
+            }
+            case ENC_SUBFORMULA_BICOND: {
+                DQBFProblem p = buildSubformulaBicondDQBF(sysLtl, spec, b);
+                std::cout << toDQDIMACS(p);
+                break;
+            }
             }
             return 0;
         }
@@ -384,6 +428,7 @@ int main(int argc, char* argv[]) {
 
         // --- helper: encode + solve for one player at one bound ---
         auto solveOnce = [&](const CoBuchiAutomaton& aut,
+                             const Ltl& ltl,
                              const Specification& playerSpec,
                              int b, const char* label) -> SolverResult {
             std::string encoded, suffix;
@@ -402,6 +447,18 @@ int main(int argc, char* argv[]) {
             }
             case ENC_SYMBOLIC: {
                 DQBFProblem p = buildSymbolicDQBF(aut, playerSpec, b);
+                encoded = toDQDIMACS(p);
+                suffix = "dqdimacs";
+                break;
+            }
+            case ENC_SUBFORMULA: {
+                DQBFProblem p = buildSubformulaTableauDQBF(ltl, playerSpec, b);
+                encoded = toDQDIMACS(p);
+                suffix = "dqdimacs";
+                break;
+            }
+            case ENC_SUBFORMULA_BICOND: {
+                DQBFProblem p = buildSubformulaBicondDQBF(ltl, playerSpec, b);
                 encoded = toDQDIMACS(p);
                 suffix = "dqdimacs";
                 break;
@@ -439,6 +496,7 @@ int main(int argc, char* argv[]) {
         int sysBound = 0, envBound = 0;
 
         auto searchLoop = [&](const CoBuchiAutomaton& aut,
+                              const Ltl& ltl,
                               const Specification& playerSpec,
                               const char* label, int playerId,
                               int& resultBound) {
@@ -446,7 +504,7 @@ int main(int argc, char* argv[]) {
                 if (cancelled) break;
                 if (verbose)
                     std::cerr << "  [" << label << "] trying bound " << b << " ...\n";
-                SolverResult r = solveOnce(aut, playerSpec, b, label);
+                SolverResult r = solveOnce(aut, ltl, playerSpec, b, label);
                 if (r == SAT) {
                     resultBound = b;
                     winner = playerId;
@@ -461,14 +519,14 @@ int main(int argc, char* argv[]) {
         if (fixedBound > 0) {
             // --- fixed bound: try both players at this bound ---
             if (verbose) std::cerr << "  [system] trying bound " << fixedBound << " ...\n";
-            SolverResult sr = solveOnce(sysAut, spec, fixedBound, "system");
+            SolverResult sr = solveOnce(sysAut, sysLtl, spec, fixedBound, "system");
             if (sr == SAT) {
                 std::cout << "REALIZABLE (bound " << fixedBound << ")\n";
                 return 0;
             }
             if (dualSearch) {
                 if (verbose) std::cerr << "  [environment] trying bound " << fixedBound << " ...\n";
-                SolverResult er = solveOnce(envAut, envSpec, fixedBound, "environment");
+                SolverResult er = solveOnce(envAut, envLtl, envSpec, fixedBound, "environment");
                 if (er == SAT) {
                     std::cout << "UNREALIZABLE (bound " << fixedBound << ")\n";
                     return 0;
@@ -480,7 +538,7 @@ int main(int argc, char* argv[]) {
 
         if (!dualSearch) {
             // --- single-player search (system only) ---
-            searchLoop(sysAut, spec, "system", 1, sysBound);
+            searchLoop(sysAut, sysLtl, spec, "system", 1, sysBound);
             if (winner == 1) {
                 std::cout << "REALIZABLE (bound " << sysBound << ")\n";
                 return 0;
@@ -491,10 +549,10 @@ int main(int argc, char* argv[]) {
 
         // --- dual parallel search ---
         std::thread sysThread([&]() {
-            searchLoop(sysAut, spec, "system", 1, sysBound);
+            searchLoop(sysAut, sysLtl, spec, "system", 1, sysBound);
         });
         std::thread envThread([&]() {
-            searchLoop(envAut, envSpec, "environment", 2, envBound);
+            searchLoop(envAut, envLtl, envSpec, "environment", 2, envBound);
         });
 
         sysThread.join();

@@ -22,11 +22,13 @@
 #pragma once
 #include "formula.h"
 #include "automaton.h"
+#include "ltl.h"
 #include <map>
 #include <vector>
 #include <string>
 #include <sstream>
 #include <cassert>
+#include <functional>
 
 // ===========================================================================
 // Specification  (mirrors SynthesisSpecification in BoSy)
@@ -884,6 +886,583 @@ inline DQBFProblem buildSymbolicDQBF(const CoBuchiAutomaton& aut,
                           fAtom("ls_" + std::to_string(b) + "_next"))));
 
     // --- assemble: (precond -> matrix) & consistency ---
+    std::vector<Fml> all;
+    if (!precond.empty())
+        all.push_back(fImplies(fAnd(precond), fAnd(matrix)));
+    else
+        all.push_back(fAnd(matrix));
+    all.insert(all.end(), consistency.begin(), consistency.end());
+    prob.matrix = fAnd(all);
+
+    return prob;
+}
+
+// ===========================================================================
+// Encoding 4:  Subformula Tableau   (DQBF / DQDIMACS)
+//
+// Built directly from the LTL formula's subformula tableau, bypassing the
+// explicit-automaton step.  Each *temporal* subformula of the (NNF) LTL
+// gets its own existential lambda function; LTL recurrences become local
+// Boolean constraints.
+//
+// Universal variables:
+//   s-bits, sp-bits         -- current/next system state
+//   <input>_cur             -- current-step input letter
+//   <input>_next            -- next-step input letter (independent of cur)
+//
+// Two input sets are essential: the LTL X operator refers to the next step,
+// whose input is independent of the current step's.  With a single input
+// universal, X applied to an input atom would alias to the current input,
+// giving the wrong semantics.
+//
+// Existential functions (each with cur/next copies, equivalence-marked):
+//   l_<id>_cur(s, inputs_cur)   l_<id>_next(sp, inputs_next)
+//   ls_<id>_<b>_cur / _next     -- per eventuality, ranking bits
+//   <output>_cur(s [, inputs_cur])   <output>_next(sp [, inputs_next])
+//                                Mealy adds inputs; Moore is state-only
+//   tau<i>(s, inputs_cur)       -- single copy; transitions read s's input
+//
+// Macro expand(psi, pos): pos in {cur, next}.  Atoms reference the matching
+// input set (input p -> p_cur or p_next) or output copy (output o -> o_cur
+// or o_next).  Boolean ops recurse; temporal subformulas become l_<id>_pos.
+//
+// Recurrences (per temporal subformula psi):
+//   X a  : lamCur -> AND_sp ( spEqTau -> expand(a, "next") )
+//   a U b: lamCur -> expand(b, "cur") OR ( expand(a, "cur") AND
+//                      AND_sp ( spEqTau -> ( lamNext AND ls_next > ls_cur ) ) )
+//   a R b: lamCur -> expand(b, "cur") AND ( expand(a, "cur") OR
+//                      AND_sp ( spEqTau -> lamNext ) )
+//   F a  : lamCur -> expand(a, "cur") OR
+//                      AND_sp ( spEqTau -> ( lamNext AND ls_next > ls_cur ) )
+//   G a  : lamCur -> expand(a, "cur") AND AND_sp ( spEqTau -> lamNext )
+//
+// Initial: (s == 0) -> expand(phiNNF, "cur").
+// Consistency: (s == sp AND inputs_cur == inputs_next) -> (cur <-> next),
+// for every cur/next pair.
+// ===========================================================================
+
+inline DQBFProblem buildSubformulaTableauDQBF(Ltl negPhiNNF,
+                                              const Specification& spec,
+                                              int bound)
+{
+    DQBFProblem prob;
+
+    SubformulaIndex idx;
+    idx.enumerate(negPhiNNF);
+
+    std::vector<Ltl> eventualities;
+    for (auto& sf : idx.all())
+        if (isEventuality(sf)) eventualities.push_back(sf);
+
+    int numSys = numBitsNeeded(bound);
+    int numEv = std::max((int)eventualities.size(), 1);
+    int numRank = numBitsNeeded(bound * numEv);
+
+    auto sB  = [](int i) { return "s"  + std::to_string(i); };
+    auto spB = [](int i) { return "sp" + std::to_string(i); };
+    auto tB  = [](int i) { return "tau" + std::to_string(i); };
+    auto lamN = [](int psiId, const std::string& pos) {
+        return "l_" + std::to_string(psiId) + "_" + pos;
+    };
+    auto rankN = [](int psiId, int bit, const std::string& pos) {
+        return "ls_" + std::to_string(psiId) + "_" + std::to_string(bit)
+             + "_" + pos;
+    };
+    auto outN = [](const std::string& name, const std::string& pos) {
+        return name + "_" + pos;
+    };
+    // Suffix-based naming for input atoms: a single LTL atom "p" maps to
+    // either "p_cur" (the current-step universal) or "p_next" (the next-step
+    // universal) depending on the position at which the atom is evaluated.
+    auto inN = [](const std::string& name, const std::string& pos) {
+        return name + "_" + pos;
+    };
+
+    // --- universal variables ---
+    std::vector<std::string> sVars, spVars, inCurVars, inNextVars;
+    for (int i = 0; i < numSys; ++i) {
+        sVars.push_back(sB(i));
+        spVars.push_back(spB(i));
+    }
+    for (auto& p : spec.inputs) {
+        inCurVars.push_back(inN(p, "cur"));
+        inNextVars.push_back(inN(p, "next"));
+    }
+    prob.universalVars = sVars;
+    prob.universalVars.insert(prob.universalVars.end(),
+                              spVars.begin(), spVars.end());
+    prob.universalVars.insert(prob.universalVars.end(),
+                              inCurVars.begin(), inCurVars.end());
+    prob.universalVars.insert(prob.universalVars.end(),
+                              inNextVars.begin(), inNextVars.end());
+
+    auto addDep = [&](const std::string& name,
+                      const std::vector<std::string>& deps) {
+        prob.existentialVars.push_back({name, deps});
+    };
+
+    std::set<std::string> inputSet(spec.inputs.begin(), spec.inputs.end());
+    bool isMealy = (spec.semantics == Specification::Mealy);
+
+    // --- output cur/next functions ---
+    // For Mealy, outputs depend on (state, current-step input).  For Moore,
+    // they depend on state only.  cur uses (s, inputs_cur); next uses
+    // (sp, inputs_next).  Equivalence + consistency tie them as the same
+    // Skolem applied at different argument tuples.
+    std::vector<std::string> outDepsCur = sVars;
+    std::vector<std::string> outDepsNext = spVars;
+    if (isMealy) {
+        outDepsCur.insert(outDepsCur.end(),
+                          inCurVars.begin(), inCurVars.end());
+        outDepsNext.insert(outDepsNext.end(),
+                           inNextVars.begin(), inNextVars.end());
+    }
+    for (auto& o : spec.outputs) {
+        addDep(outN(o, "cur"), outDepsCur);
+        addDep(outN(o, "next"), outDepsNext);
+        prob.equivalentVars.push_back({outN(o, "cur"), outN(o, "next")});
+    }
+
+    // --- transition function tau (depends on s and current input only) ---
+    std::vector<std::string> tauDeps = sVars;
+    tauDeps.insert(tauDeps.end(), inCurVars.begin(), inCurVars.end());
+    for (int i = 0; i < numSys; ++i)
+        addDep(tB(i), tauDeps);
+
+    // --- lambda for each temporal subformula EXCEPT X ---
+    // X-subformulas are inlined at expansion time (see expand below); they
+    // do NOT get lambda variables.  Reason: if "X p" got a lambda, biconditional
+    // structures like (X locked <-> X hl_0) would decompose into independent
+    // lambda obligations that lose correlation between the two X-values, giving
+    // spurious UNSAT.  Inlining X expands "(X locked ∧ X hl_0) ∨ (X¬locked ∧
+    // X¬hl_0)" into a formula directly over (sp, inputs_next), which the solver
+    // can satisfy by tying locked_next to inputs_next.hl_0.
+    //
+    // U/R/F/G need lambdas because they recurse to themselves via X-step.
+    // Lambdas are INPUT-DEPENDENT: lambda_psi_cur(s, inputs_cur).
+    auto isXOnly = [](LKind k) { return k == LKind::X; };
+    std::vector<std::string> lamDepsCur = sVars;
+    lamDepsCur.insert(lamDepsCur.end(), inCurVars.begin(), inCurVars.end());
+    std::vector<std::string> lamDepsNext = spVars;
+    lamDepsNext.insert(lamDepsNext.end(),
+                       inNextVars.begin(), inNextVars.end());
+    for (auto& sf : idx.all()) {
+        if (!isTemporal(sf->kind) || isXOnly(sf->kind)) continue;
+        int id = idx.id(sf);
+        addDep(lamN(id, "cur"), lamDepsCur);
+        addDep(lamN(id, "next"), lamDepsNext);
+        prob.equivalentVars.push_back({lamN(id, "cur"), lamN(id, "next")});
+    }
+
+    // --- ranking bits for each eventuality (input-dependent, like lambda) ---
+    for (auto& sf : eventualities) {
+        int id = idx.id(sf);
+        for (int b = 0; b < numRank; ++b) {
+            addDep(rankN(id, b, "cur"), lamDepsCur);
+            addDep(rankN(id, b, "next"), lamDepsNext);
+            prob.equivalentVars.push_back(
+                {rankN(id, b, "cur"), rankN(id, b, "next")});
+        }
+    }
+
+    // --- helper: bit-pattern equality ---
+    auto encodeBits = [](int val, int nbits,
+                         const std::function<std::string(int)>& bitName) {
+        std::string bin = binaryFrom(val, nbits);
+        std::vector<Fml> bits;
+        for (int j = 0; j < nbits; ++j) {
+            Fml v = fAtom(bitName(j));
+            bits.push_back(bin[j] == '1' ? v : fNot(v));
+        }
+        return fAnd(bits);
+    };
+
+    // --- spEqTau: universal sp-bits equal existential tau-bits ---
+    // (Defined here, before `expand`, because the X-rule inlines spEqTau.)
+    std::vector<Fml> tauEq;
+    for (int j = 0; j < numSys; ++j)
+        tauEq.push_back(fIff(fAtom(spB(j)), fAtom(tB(j))));
+    Fml spEqTau = fAnd(tauEq);
+
+    // --- expand: LTL subformula -> propositional Fml at cur/next position ---
+    // pos in {cur, next} selects (s, inputs_cur) vs (sp, inputs_next).
+    // X-subformulas are inlined: expand(X psi', "cur") = spEqTau -> expand(psi',
+    // "next").  This preserves the correlation between multiple X-subformulas
+    // in a Boolean composition (key for biconditionals like X a <-> X b).
+    // Nested X (X X p) would require a "next-of-next" position, which this
+    // single-step encoding does not provide; if encountered, throw.
+    std::function<Fml(const Ltl&, const std::string&)> expand;
+    expand = [&](const Ltl& psi, const std::string& pos) -> Fml {
+        switch (psi->kind) {
+        case LKind::Top: return fTop();
+        case LKind::Bot: return fBot();
+        case LKind::Atom: {
+            if (inputSet.count(psi->name)) return fAtom(inN(psi->name, pos));
+            return fAtom(outN(psi->name, pos));
+        }
+        case LKind::Not: return fNot(expand(psi->children[0], pos));
+        case LKind::And: {
+            std::vector<Fml> cs;
+            for (auto& c : psi->children) cs.push_back(expand(c, pos));
+            return fAnd(cs);
+        }
+        case LKind::Or: {
+            std::vector<Fml> cs;
+            for (auto& c : psi->children) cs.push_back(expand(c, pos));
+            return fOr(cs);
+        }
+        case LKind::X: {
+            if (pos != "cur")
+                throw std::runtime_error(
+                    "subformula tableau encoding: nested X (X applied at "
+                    "the 'next' position) is not supported");
+            return fImplies(spEqTau, expand(psi->children[0], "next"));
+        }
+        default:  // U / R / F / G — use lambda
+            return fAtom(lamN(idx.id(psi), pos));
+        }
+    };
+
+    std::vector<Fml> precond, matrix, consistency;
+
+    // --- preconditions: exclude invalid bit-patterns ---
+    for (int i = bound; i < (1 << numSys); ++i) {
+        precond.push_back(fNot(encodeBits(i, numSys, sB)));
+        precond.push_back(fNot(encodeBits(i, numSys, spB)));
+        matrix.push_back(fNot(encodeBits(i, numSys, tB)));
+    }
+
+    // --- initial: (s == 0) -> expand(negPhi, "cur") ---
+    Fml sIsZero = encodeBits(0, numSys, sB);
+    matrix.push_back(fImplies(sIsZero, expand(negPhiNNF, "cur")));
+
+    // --- per-temporal-subformula recurrences ---
+    // X-subformulas are inlined in expand(); skip them here.
+    for (auto& psi : idx.all()) {
+        if (!isTemporal(psi->kind) || psi->kind == LKind::X) continue;
+        int id = idx.id(psi);
+        Fml lamCur  = fAtom(lamN(id, "cur"));
+        Fml lamNext = fAtom(lamN(id, "next"));
+
+        auto rankDecrease = [&]() -> Fml {
+            std::vector<Fml> rNext, rCur;
+            for (int b = 0; b < numRank; ++b) {
+                rNext.push_back(fAtom(rankN(id, b, "next")));
+                rCur.push_back(fAtom(rankN(id, b, "cur")));
+            }
+            return bvGreater(rNext, rCur);
+        };
+
+        switch (psi->kind) {
+        case LKind::U: {
+            Fml dischargeBranch = expand(psi->children[1], "cur");
+            Fml delay = fImplies(spEqTau, fAnd(lamNext, rankDecrease()));
+            Fml progressBranch = fAnd(expand(psi->children[0], "cur"), delay);
+            matrix.push_back(fImplies(lamCur,
+                                      fOr(dischargeBranch, progressBranch)));
+            break;
+        }
+        case LKind::R: {
+            Fml safetyBranch = expand(psi->children[1], "cur");
+            Fml continuation = fImplies(spEqTau, lamNext);
+            Fml progress = fOr(expand(psi->children[0], "cur"), continuation);
+            matrix.push_back(fImplies(lamCur, fAnd(safetyBranch, progress)));
+            break;
+        }
+        case LKind::F: {
+            Fml dischargeBranch = expand(psi->children[0], "cur");
+            Fml delay = fImplies(spEqTau, fAnd(lamNext, rankDecrease()));
+            matrix.push_back(fImplies(lamCur, fOr(dischargeBranch, delay)));
+            break;
+        }
+        case LKind::G: {
+            Fml safetyBranch = expand(psi->children[0], "cur");
+            Fml continuation = fImplies(spEqTau, lamNext);
+            matrix.push_back(fImplies(lamCur, fAnd(safetyBranch, continuation)));
+            break;
+        }
+        default: break;
+        }
+    }
+
+    // --- consistency: (s == sp AND inputs_cur == inputs_next)
+    //                -> (cur <-> next) for every paired var ---
+    std::vector<Fml> argsMatch;
+    for (int j = 0; j < numSys; ++j)
+        argsMatch.push_back(fIff(fAtom(sB(j)), fAtom(spB(j))));
+    for (size_t i = 0; i < spec.inputs.size(); ++i)
+        argsMatch.push_back(fIff(fAtom(inCurVars[i]), fAtom(inNextVars[i])));
+    Fml statesMatch = fAnd(argsMatch);
+
+    for (auto& [a, b] : prob.equivalentVars)
+        consistency.push_back(
+            fImplies(statesMatch, fIff(fAtom(a), fAtom(b))));
+
+    // --- assemble: (precond -> matrix) & consistency ---
+    std::vector<Fml> all;
+    if (!precond.empty())
+        all.push_back(fImplies(fAnd(precond), fAnd(matrix)));
+    else
+        all.push_back(fAnd(matrix));
+    all.insert(all.end(), consistency.begin(), consistency.end());
+    prob.matrix = fAnd(all);
+
+    return prob;
+}
+
+// ===========================================================================
+// Encoding 5:  NuSMV-style Subformula Tableau   (DQBF / DQDIMACS)
+//
+// A variant of Encoding 4 that follows the NuSMV "satellite" tableau style:
+// every subformula gets its own existential Boolean function x_<id>_cur and
+// x_<id>_next, and the local LTL recurrences are stated as BICONDITIONALS
+// rather than one-way implications.  Falsity propagates in both directions,
+// allowing the synthesiser to set x_G_b false on traces destined to violate
+// assumptions and pick the F-branch instead.
+//
+// Atoms:                x_p   <-> p_value_at_pos
+// Boolean composition:  x_neg p, x_a&b, x_a|b biconditionally tied to comps.
+// Temporal:
+//   x_X a   : x_Xa_cur <-> spEqTau -> x_a_next   (kept inlined, not a Skolem)
+//   x_a U b : x_aUb <-> x_b OR (x_a AND  spEqTau -> x_aUb(next) ) + ranking
+//   x_a R b : x_aRb <-> x_b AND (x_a OR  spEqTau -> x_aRb(next) )
+//   x_F a   : x_Fa  <-> x_a  OR ( spEqTau -> x_Fa(next) ) + ranking
+//   x_G a   : x_Ga  <-> x_a  AND ( spEqTau -> x_Ga(next) )
+//
+// Initial: (s == 0) -> x_phi_cur.
+// ===========================================================================
+
+inline DQBFProblem buildSubformulaBicondDQBF(Ltl phiNNF,
+                                             const Specification& spec,
+                                             int bound)
+{
+    DQBFProblem prob;
+
+    SubformulaIndex idx;
+    idx.enumerate(phiNNF);
+
+    std::vector<Ltl> eventualities;
+    for (auto& sf : idx.all())
+        if (isEventuality(sf)) eventualities.push_back(sf);
+
+    int numSys = numBitsNeeded(bound);
+    int numEv = std::max((int)eventualities.size(), 1);
+    int numRank = numBitsNeeded(bound * numEv);
+
+    auto sB  = [](int i) { return "s"  + std::to_string(i); };
+    auto spB = [](int i) { return "sp" + std::to_string(i); };
+    auto tB  = [](int i) { return "tau" + std::to_string(i); };
+    auto xN = [](int psiId, const std::string& pos) {
+        return "x_" + std::to_string(psiId) + "_" + pos;
+    };
+    auto rankN = [](int psiId, int bit, const std::string& pos) {
+        return "ls_" + std::to_string(psiId) + "_" + std::to_string(bit)
+             + "_" + pos;
+    };
+    auto outN = [](const std::string& name, const std::string& pos) {
+        return name + "_" + pos;
+    };
+    auto inN = [](const std::string& name, const std::string& pos) {
+        return name + "_" + pos;
+    };
+
+    // --- universal variables ---
+    std::vector<std::string> sVars, spVars, inCurVars, inNextVars;
+    for (int i = 0; i < numSys; ++i) {
+        sVars.push_back(sB(i));
+        spVars.push_back(spB(i));
+    }
+    for (auto& p : spec.inputs) {
+        inCurVars.push_back(inN(p, "cur"));
+        inNextVars.push_back(inN(p, "next"));
+    }
+    prob.universalVars = sVars;
+    prob.universalVars.insert(prob.universalVars.end(),
+                              spVars.begin(), spVars.end());
+    prob.universalVars.insert(prob.universalVars.end(),
+                              inCurVars.begin(), inCurVars.end());
+    prob.universalVars.insert(prob.universalVars.end(),
+                              inNextVars.begin(), inNextVars.end());
+
+    auto addDep = [&](const std::string& name,
+                      const std::vector<std::string>& deps) {
+        prob.existentialVars.push_back({name, deps});
+    };
+
+    std::set<std::string> inputSet(spec.inputs.begin(), spec.inputs.end());
+    bool isMealy = (spec.semantics == Specification::Mealy);
+
+    std::vector<std::string> outDepsCur = sVars;
+    std::vector<std::string> outDepsNext = spVars;
+    if (isMealy) {
+        outDepsCur.insert(outDepsCur.end(),
+                          inCurVars.begin(), inCurVars.end());
+        outDepsNext.insert(outDepsNext.end(),
+                           inNextVars.begin(), inNextVars.end());
+    }
+    for (auto& o : spec.outputs) {
+        addDep(outN(o, "cur"), outDepsCur);
+        addDep(outN(o, "next"), outDepsNext);
+        prob.equivalentVars.push_back({outN(o, "cur"), outN(o, "next")});
+    }
+
+    std::vector<std::string> tauDeps = sVars;
+    tauDeps.insert(tauDeps.end(), inCurVars.begin(), inCurVars.end());
+    for (int i = 0; i < numSys; ++i)
+        addDep(tB(i), tauDeps);
+
+    // x_psi for EVERY subformula except X (inlined) and Top/Bot (constant).
+    std::vector<std::string> xDepsCur = sVars;
+    xDepsCur.insert(xDepsCur.end(), inCurVars.begin(), inCurVars.end());
+    std::vector<std::string> xDepsNext = spVars;
+    xDepsNext.insert(xDepsNext.end(), inNextVars.begin(), inNextVars.end());
+    for (auto& sf : idx.all()) {
+        if (sf->kind == LKind::X) continue;
+        if (sf->kind == LKind::Top || sf->kind == LKind::Bot) continue;
+        int id = idx.id(sf);
+        addDep(xN(id, "cur"), xDepsCur);
+        addDep(xN(id, "next"), xDepsNext);
+        prob.equivalentVars.push_back({xN(id, "cur"), xN(id, "next")});
+    }
+
+    for (auto& sf : eventualities) {
+        int id = idx.id(sf);
+        for (int b = 0; b < numRank; ++b) {
+            addDep(rankN(id, b, "cur"), xDepsCur);
+            addDep(rankN(id, b, "next"), xDepsNext);
+            prob.equivalentVars.push_back(
+                {rankN(id, b, "cur"), rankN(id, b, "next")});
+        }
+    }
+
+    auto encodeBits = [](int val, int nbits,
+                         const std::function<std::string(int)>& bitName) {
+        std::string bin = binaryFrom(val, nbits);
+        std::vector<Fml> bits;
+        for (int j = 0; j < nbits; ++j) {
+            Fml v = fAtom(bitName(j));
+            bits.push_back(bin[j] == '1' ? v : fNot(v));
+        }
+        return fAnd(bits);
+    };
+
+    std::vector<Fml> tauEq;
+    for (int j = 0; j < numSys; ++j)
+        tauEq.push_back(fIff(fAtom(spB(j)), fAtom(tB(j))));
+    Fml spEqTau = fAnd(tauEq);
+
+    std::function<Fml(const Ltl&, const std::string&)> xRef;
+    xRef = [&](const Ltl& psi, const std::string& pos) -> Fml {
+        switch (psi->kind) {
+        case LKind::Top: return fTop();
+        case LKind::Bot: return fBot();
+        case LKind::X: {
+            if (pos != "cur")
+                throw std::runtime_error(
+                    "subformula-bicond: nested X not supported");
+            return fImplies(spEqTau, xRef(psi->children[0], "next"));
+        }
+        default:
+            return fAtom(xN(idx.id(psi), pos));
+        }
+    };
+
+    std::vector<Fml> precond, matrix, consistency;
+
+    for (int i = bound; i < (1 << numSys); ++i) {
+        precond.push_back(fNot(encodeBits(i, numSys, sB)));
+        precond.push_back(fNot(encodeBits(i, numSys, spB)));
+        matrix.push_back(fNot(encodeBits(i, numSys, tB)));
+    }
+
+    Fml sIsZero = encodeBits(0, numSys, sB);
+    matrix.push_back(fImplies(sIsZero, xRef(phiNNF, "cur")));
+
+    for (auto& psi : idx.all()) {
+        if (psi->kind == LKind::Top || psi->kind == LKind::Bot) continue;
+        if (psi->kind == LKind::X) continue;
+        Fml xCur = xRef(psi, "cur");
+        Fml rhs;
+        switch (psi->kind) {
+        case LKind::Atom: {
+            if (inputSet.count(psi->name))
+                rhs = fAtom(inN(psi->name, "cur"));
+            else
+                rhs = fAtom(outN(psi->name, "cur"));
+            break;
+        }
+        case LKind::Not: {
+            rhs = fNot(xRef(psi->children[0], "cur"));
+            break;
+        }
+        case LKind::And: {
+            std::vector<Fml> cs;
+            for (auto& c : psi->children) cs.push_back(xRef(c, "cur"));
+            rhs = fAnd(cs);
+            break;
+        }
+        case LKind::Or: {
+            std::vector<Fml> cs;
+            for (auto& c : psi->children) cs.push_back(xRef(c, "cur"));
+            rhs = fOr(cs);
+            break;
+        }
+        case LKind::U: {
+            Fml xNext = xRef(psi, "next");
+            std::vector<Fml> rNext, rCur;
+            int id = idx.id(psi);
+            for (int b = 0; b < numRank; ++b) {
+                rNext.push_back(fAtom(rankN(id, b, "next")));
+                rCur.push_back(fAtom(rankN(id, b, "cur")));
+            }
+            Fml rankUp = bvGreater(rNext, rCur);
+            Fml delay = fImplies(spEqTau, fAnd(xNext, rankUp));
+            rhs = fOr(xRef(psi->children[1], "cur"),
+                      fAnd(xRef(psi->children[0], "cur"), delay));
+            break;
+        }
+        case LKind::R: {
+            Fml xNext = xRef(psi, "next");
+            Fml continuation = fImplies(spEqTau, xNext);
+            rhs = fAnd(xRef(psi->children[1], "cur"),
+                       fOr(xRef(psi->children[0], "cur"), continuation));
+            break;
+        }
+        case LKind::F: {
+            Fml xNext = xRef(psi, "next");
+            std::vector<Fml> rNext, rCur;
+            int id = idx.id(psi);
+            for (int b = 0; b < numRank; ++b) {
+                rNext.push_back(fAtom(rankN(id, b, "next")));
+                rCur.push_back(fAtom(rankN(id, b, "cur")));
+            }
+            Fml rankUp = bvGreater(rNext, rCur);
+            Fml delay = fImplies(spEqTau, fAnd(xNext, rankUp));
+            rhs = fOr(xRef(psi->children[0], "cur"), delay);
+            break;
+        }
+        case LKind::G: {
+            Fml xNext = xRef(psi, "next");
+            Fml continuation = fImplies(spEqTau, xNext);
+            rhs = fAnd(xRef(psi->children[0], "cur"), continuation);
+            break;
+        }
+        default: continue;
+        }
+        matrix.push_back(fIff(xCur, rhs));
+    }
+
+    std::vector<Fml> argsMatch;
+    for (int j = 0; j < numSys; ++j)
+        argsMatch.push_back(fIff(fAtom(sB(j)), fAtom(spB(j))));
+    for (size_t i = 0; i < spec.inputs.size(); ++i)
+        argsMatch.push_back(fIff(fAtom(inCurVars[i]), fAtom(inNextVars[i])));
+    Fml statesMatch = fAnd(argsMatch);
+
+    for (auto& [a, b] : prob.equivalentVars)
+        consistency.push_back(
+            fImplies(statesMatch, fIff(fAtom(a), fAtom(b))));
+
     std::vector<Fml> all;
     if (!precond.empty())
         all.push_back(fImplies(fAnd(precond), fAnd(matrix)));

@@ -6,7 +6,7 @@ TARGET    = bosy_standalone
 
 all: $(TARGET)
 
-$(TARGET): main.cpp formula.h automaton.h encoding.h
+$(TARGET): main.cpp formula.h automaton.h encoding.h ltl.h
 	$(CXX) $(CXXFLAGS) -o $@ main.cpp
 
 clean:
