@@ -24,6 +24,9 @@
 #include <vector>
 #include <set>
 #include <functional>
+#include <unordered_map>
+#include <mutex>
+#include <algorithm>
 
 // Node types for the formula DAG.
 enum class FKind { Top, Bot, Atom, Not, And, Or };
@@ -37,6 +40,56 @@ struct Formula {
 
 // The handle type used everywhere.  Formulas are immutable once built.
 using Fml = std::shared_ptr<const Formula>;
+
+// --- Hash-consing caches ------------------------------------------------
+//
+// Constructors return a *shared* node for any logically-equal input, so
+// equal subtrees have identical pointer identity.  This matters for the
+// Tseitin encoder in encoding.h, whose memoisation cache is keyed by
+// raw pointer: without interning, structurally-equal subterms (e.g. the
+// same `lsBit(s,q,b)` atom built in different recursive `bvGreater`
+// calls) are encoded into CNF independently and each gets a fresh aux
+// variable.
+//
+// Caches are global and mutex-protected; construction is rare enough
+// that contention is not a concern.  The caches keep nodes alive for
+// the lifetime of the process, which is fine for the short-lived
+// encoding runs of this tool.
+
+namespace formula_detail {
+
+inline std::mutex& cacheMutex() { static std::mutex m; return m; }
+
+inline std::unordered_map<std::string, Fml>& atomCache() {
+    static std::unordered_map<std::string, Fml> m; return m;
+}
+
+inline std::unordered_map<const Formula*, Fml>& notCache() {
+    static std::unordered_map<const Formula*, Fml> m; return m;
+}
+
+// Key = canonical (sorted-by-pointer, deduplicated) child vector.
+struct VecHash {
+    size_t operator()(const std::vector<Fml>& v) const noexcept {
+        size_t h = v.size();
+        for (auto& f : v)
+            h = h * 1315423911u ^ std::hash<const void*>()(f.get());
+        return h;
+    }
+};
+struct VecEq {
+    bool operator()(const std::vector<Fml>& a, const std::vector<Fml>& b) const noexcept {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].get() != b[i].get()) return false;
+        return true;
+    }
+};
+using NaryCache = std::unordered_map<std::vector<Fml>, Fml, VecHash, VecEq>;
+inline NaryCache& andCache() { static NaryCache m; return m; }
+inline NaryCache& orCache()  { static NaryCache m; return m; }
+
+} // namespace formula_detail
 
 // --- Constant constructors (singletons) ---
 
@@ -53,10 +106,16 @@ inline Fml fBot() {
 // --- Atom: a named propositional variable ---
 
 inline Fml fAtom(const std::string& name) {
-    return std::make_shared<Formula>(Formula{FKind::Atom, name, nullptr, {}});
+    std::lock_guard<std::mutex> lk(formula_detail::cacheMutex());
+    auto& cache = formula_detail::atomCache();
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+    auto a = std::make_shared<Formula>(Formula{FKind::Atom, name, nullptr, {}});
+    cache.emplace(name, a);
+    return a;
 }
 
-// --- Negation (with double-negation elimination) ---
+// --- Negation (with double-negation elimination + hash-consing) ---
 
 inline Fml fNot(Fml f) {
     if (!f) return nullptr;
@@ -64,9 +123,15 @@ inline Fml fNot(Fml f) {
     case FKind::Top: return fBot();
     case FKind::Bot: return fTop();
     case FKind::Not: return f->child;   // !!x = x
-    default:
-        return std::make_shared<Formula>(Formula{FKind::Not, {}, f, {}});
+    default: break;
     }
+    std::lock_guard<std::mutex> lk(formula_detail::cacheMutex());
+    auto& cache = formula_detail::notCache();
+    auto it = cache.find(f.get());
+    if (it != cache.end()) return it->second;
+    auto n = std::make_shared<Formula>(Formula{FKind::Not, {}, f, {}});
+    cache.emplace(f.get(), n);
+    return n;
 }
 
 // --- N-ary conjunction (flattening + short-circuit) ---
@@ -83,7 +148,19 @@ inline Fml fAnd(std::vector<Fml> ops) {
     }
     if (flat.empty()) return fTop();       // empty conjunction = true
     if (flat.size() == 1) return flat[0];
-    return std::make_shared<Formula>(Formula{FKind::And, {}, nullptr, std::move(flat)});
+    // Canonicalise children (sort by pointer + dedup) so logically-equal
+    // conjunctions share a single hash-consed node.
+    std::sort(flat.begin(), flat.end(),
+              [](const Fml& a, const Fml& b) { return a.get() < b.get(); });
+    flat.erase(std::unique(flat.begin(), flat.end()), flat.end());
+    if (flat.size() == 1) return flat[0];
+    std::lock_guard<std::mutex> lk(formula_detail::cacheMutex());
+    auto& cache = formula_detail::andCache();
+    auto it = cache.find(flat);
+    if (it != cache.end()) return it->second;
+    auto n = std::make_shared<Formula>(Formula{FKind::And, {}, nullptr, flat});
+    cache.emplace(std::move(flat), n);
+    return n;
 }
 
 inline Fml fAnd(Fml a, Fml b) { return fAnd(std::vector<Fml>{a, b}); }
@@ -102,7 +179,17 @@ inline Fml fOr(std::vector<Fml> ops) {
     }
     if (flat.empty()) return fBot();       // empty disjunction = false
     if (flat.size() == 1) return flat[0];
-    return std::make_shared<Formula>(Formula{FKind::Or, {}, nullptr, std::move(flat)});
+    std::sort(flat.begin(), flat.end(),
+              [](const Fml& a, const Fml& b) { return a.get() < b.get(); });
+    flat.erase(std::unique(flat.begin(), flat.end()), flat.end());
+    if (flat.size() == 1) return flat[0];
+    std::lock_guard<std::mutex> lk(formula_detail::cacheMutex());
+    auto& cache = formula_detail::orCache();
+    auto it = cache.find(flat);
+    if (it != cache.end()) return it->second;
+    auto n = std::make_shared<Formula>(Formula{FKind::Or, {}, nullptr, flat});
+    cache.emplace(std::move(flat), n);
+    return n;
 }
 
 inline Fml fOr(Fml a, Fml b) { return fOr(std::vector<Fml>{a, b}); }
