@@ -844,22 +844,44 @@ inline DQBFProblem buildSymbolicDQBF(const CoBuchiAutomaton& aut,
         tauEq.push_back(fIff(fAtom(spB(j)), fAtom(tB(j))));
     Fml spEqTau = fAnd(tauEq);
 
-    // --- ranking (global, not SCC-optimised) ---
+    // --- ranking (SCC-gated, matching input-symbolic/state-symbolic) ---
+    //
+    // The ranking only applies when (q, qp) is a within-SCC transition of
+    // a rejecting SCC.  Without this gate the counter has to make progress
+    // along every transition globally, which at low bounds (the counter
+    // has numBitsNeeded(bound) bits) makes runs through two distinct
+    // rejecting SCCs infeasible even when the spec is realisable.
     std::vector<Fml> lsNext, lsCur;
     for (int b = 0; b < numRank; ++b) {
         lsNext.push_back(fAtom("ls_" + std::to_string(b) + "_next"));
         lsCur.push_back(fAtom("ls_" + std::to_string(b) + "_cur"));
     }
+    // sameRejSCC(q, qp) = OR over (q,qp) pairs that share a rejecting SCC
+    std::vector<Fml> rejSCCParts;
+    for (auto& q : autStates) {
+        if (aut.isStateInNonRejectingSCC(q)) continue;
+        int qIdx = (int)(std::find(autStates.begin(), autStates.end(), q)
+                         - autStates.begin());
+        Fml qMatch = encodeBits(qIdx, numAut, qB);
+        for (auto& qp : autStates) {
+            if (aut.isStateInNonRejectingSCC(qp)) continue;
+            if (!aut.isInSameSCC(q, qp)) continue;
+            int qpIdx = (int)(std::find(autStates.begin(), autStates.end(), qp)
+                              - autStates.begin());
+            rejSCCParts.push_back(fAnd(qMatch, encodeBits(qpIdx, numAut, qpB)));
+        }
+    }
+    Fml sameRejSCC = rejSCCParts.empty() ? fBot() : fOr(rejSCCParts);
     Fml ranking = fAnd(
         fImplies(rejecting, bvGreater(lsNext, lsCur)),
         fImplies(fNot(rejecting), bvGreaterOrEqual(lsNext, lsCur))
     );
 
     // --- main transition constraint ---
-    // (l_cur & delta & sp=tau) -> (l_next & ranking)
+    // (l_cur & delta & sp=tau) -> (l_next & (sameRejSCC -> ranking))
     matrix.push_back(
         fImplies(fAnd({fAtom("l_cur"), delta, spEqTau}),
-                 fAnd(fAtom("l_next"), ranking))
+                 fAnd(fAtom("l_next"), fImplies(sameRejSCC, ranking)))
     );
 
     // --- safety: l_cur -> AND(q=qi -> safety_i) ---
