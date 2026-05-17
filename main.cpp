@@ -262,7 +262,8 @@ static void usage(const char* prog) {
         << "  --bound <n>               Use a fixed bound (skip search)\n"
         << "  --max-bound <n>           Maximum bound for search (default: 32)\n"
         << "  --no-dual                 Disable parallel environment search\n"
-        << "  --dump                    Dump the encoding to stdout and exit\n"
+        << "  --dump                    Dump the system-side encoding to stdout and exit\n"
+        << "  --dump-env                Dump the environment-side encoding to stdout and exit\n"
         << "  -v, --verbose             Verbose output\n"
         << "  -h, --help                Show this help\n"
         << "\n"
@@ -285,6 +286,7 @@ int main(int argc, char* argv[]) {
     int maxBound           = 32;
     bool verbose           = false;
     bool dumpOnly          = false;
+    bool dumpEnv           = false;
     bool dualSearch        = true;
 
     for (int i = 1; i < argc; ++i) {
@@ -292,6 +294,7 @@ int main(int argc, char* argv[]) {
         if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a == "-v" || a == "--verbose") verbose = true;
         else if (a == "--dump") dumpOnly = true;
+        else if (a == "--dump-env") { dumpOnly = true; dumpEnv = true; }
         else if (a == "--no-dual") dualSearch = false;
         else if (a == "--encoding" && i+1<argc) encoding = argv[++i];
         else if (a == "--solver"   && i+1<argc) solver   = argv[++i];
@@ -338,7 +341,7 @@ int main(int argc, char* argv[]) {
         // 3. Build automaton for environment player (dualized spec)
         Specification envSpec;
         CoBuchiAutomaton envAut;
-        if (dualSearch && !dumpOnly) {
+        if ((dualSearch && !dumpOnly) || dumpEnv) {
             envSpec = dualize(spec);
             std::string envLTL = buildNegatedLTL(envSpec);
             if (verbose) std::cerr << "Environment LTL (negated): " << envLTL << "\n";
@@ -353,22 +356,24 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 4. Dump-only mode: print the system encoding and exit
+        // 4. Dump-only mode: print the chosen side's encoding and exit
         if (dumpOnly) {
             int b = (fixedBound > 0) ? fixedBound : 1;
+            const CoBuchiAutomaton& aut = dumpEnv ? envAut  : sysAut;
+            const Specification&    sp  = dumpEnv ? envSpec : spec;
             switch (encKind) {
             case ENC_QBF: {
-                QBFProblem p = buildInputSymbolicQBF(sysAut, spec, b);
+                QBFProblem p = buildInputSymbolicQBF(aut, sp, b);
                 std::cout << toQDIMACS(p);
                 break;
             }
             case ENC_STATE_SYM: {
-                DQBFProblem p = buildStateSymbolicDQBF(sysAut, spec, b);
+                DQBFProblem p = buildStateSymbolicDQBF(aut, sp, b);
                 std::cout << toDQDIMACS(p);
                 break;
             }
             case ENC_SYMBOLIC: {
-                DQBFProblem p = buildSymbolicDQBF(sysAut, spec, b);
+                DQBFProblem p = buildSymbolicDQBF(aut, sp, b);
                 std::cout << toDQDIMACS(p);
                 break;
             }
